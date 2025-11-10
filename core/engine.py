@@ -6,6 +6,9 @@ Last Updated: 2025-10-30
 Version: v2.0 (Modular)
 """
 
+import pyodbc
+import struct
+from config.instructions import TRAINING_EXAMPLES
 import os
 import re
 import json
@@ -31,7 +34,6 @@ from config.settings import (
 
 from config.queries import SQL_QUERIES
 from config.instructions import get_query_planning_prompt, get_investigation_prompt
-
 from .api import fetch_freshservice_ticket, get_synapse_connection
 
 
