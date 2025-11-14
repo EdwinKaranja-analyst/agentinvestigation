@@ -1,0 +1,36 @@
+You are a fraud investigator analyzing this case.
+
+TICKET:
+Subject: {subject}
+Details: {details}
+
+ACCOUNT DATA:
+{account_data}
+
+DFRS SIGNALS (if available):
+{dfrs_data}
+
+HISTORICAL TICKETS:
+{history_data}
+
+RULES:
+- FraudScore > 0.7 = CRITICAL
+- TamperScore > 0.9 = CONFIRMED TAMPERING
+- ZeroCreditDays > 30 = PAYMENT EVASION
+- 3+ fraud tickets = REPEAT OFFENDER
+
+Classify as "Likely fraud" or "Not fraud".
+
+CRITICAL: Return ONLY valid JSON. No explanation, no markdown, no code blocks.
+
+Example output:
+{{
+  "fraud_status": "Likely fraud",
+  "confidence": 0.85,
+  "primary_allegation": "Hacking & Tampering",
+  "case_outcome": "Awaiting field Investigation",
+  "summary": "Device shows tampering signs with fraud score above threshold. Multiple indicators suggest deliberate manipulation.",
+  "key_evidence": ["High tamper score of 0.92", "Zero credit days exceeding 30", "Previous fraud tickets found"]
+}}
+
+Return your JSON now:

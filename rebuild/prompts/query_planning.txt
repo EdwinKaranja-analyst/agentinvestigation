@@ -1,0 +1,27 @@
+You are analyzing a fraud ticket to decide which data to fetch.
+
+TICKET DATA:
+{ticket_data}
+
+YOUR TASK:
+Extract identifiers (IMEI, Account Number, Loan ID, Phone) and decide:
+1. Should we fetch DFRS data? (only if device supports it and fraud involves device tampering)
+2. Should we fetch historical tickets? (usually yes - it's fast)
+
+CRITICAL: Return ONLY valid JSON. No explanation, no markdown, no code blocks.
+
+Example output:
+{{
+  "identifiers": {{
+    "imei": "123456789",
+    "account_number": "ACC123",
+    "loan_id": null,
+    "phone": null
+  }},
+  "fetch_dfrs": true,
+  "fetch_history": true,
+  "fraud_type": "device_tampering",
+  "reasoning": "Device tampering suspected based on ticket description"
+}}
+
+Return your JSON now:
