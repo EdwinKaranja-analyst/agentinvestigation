@@ -1,6 +1,15 @@
 """
-M-KOPA Fraud Investigation Engine
-Single file with all core logic
+M-KOPA Fraud Investigation Engine v2.0
+Evidence-based investigation with allegation-specific rules
+
+Updates in v2.0:
+- Investigation subject identification (Customer/DSR/External)
+- Allegation-specific decision guidance
+- Wrong escalation detection
+- Evidence-based thresholds from 632 cases
+- Simplified structure (maintains compatibility with existing files)
+
+Last Updated: 2025-11-14
 """
 
 import os
@@ -18,10 +27,92 @@ from azure.identity import AzureCliCredential
 
 import config
 
+# ============================================================================
+# ALLEGATION-SPECIFIC GUIDANCE (NEW IN V2.0)
+# ============================================================================
 
-# =============================================================================
-# DATABASE HELPERS
-# =============================================================================
+ALLEGATION_GUIDANCE = {
+    'resale': """
+PRIMARY CHECK: Are payments continuing?
+- YES → NOT fraud (legitimate transfer/gift - ALLOWED BY POLICY)
+- NO → Likely fraud (payment breach)
+Note: Resale allowed if customer/recipient pays. No field investigation for resale.
+Fraud Rate: 70% | Key: Payment status determines fraud, not resale itself
+""",
+    
+    'identity_theft': """
+PRIMARY CHECK: DSR involved?
+- YES → CRITICAL PATTERN: DSR stolen ID fraud
+  → Classification: Confirmed/Likely fraud
+  → Outcome: DSR investigation + discipline
+- NO → Check family member application
+  → Family member + Payments continuing → NOT fraud (cultural norm in Kenya)
+  → Customer confirms account → NOT fraud
+  → Customer denies + KYC issues → Investigate
+Fraud Rate: 25.2% | Note: 74% NOT fraud (often family applications)
+""",
+    
+    'cash_loan_fraud': """
+IDENTIFY SCENARIO (3 patterns):
+1. External Scam (60%): Facebook, OTP fishing, call from fraudster
+   → Suspect: External | Outcome: Field investigation
+2. Account Takeover (30%): PIN reset, password change, hijacking
+   → Suspect: External | Outcome: Field investigation  
+3. Customer Denies (10%): Loan appeared, customer claims no knowledge
+   → Investigate thoroughly
+Fraud Rate: 58.8% (HIGHEST!) | Priority: CRITICAL
+""",
+    
+    'hacking_tampering': """
+QUICK TRIAGE (<5 min for 79% of cases):
+- Generic device complaint ("not working", "screen", "battery")
+  + DFRS TamperScore < 0.6
+  → NOT fraud (92% confidence) → Auto-close, refer to tech support
+- Specific tampering ("lock disabled", "IMEI changed", "bypass")
+  + DFRS TamperScore > 0.9
+  → Likely fraud (88% confidence) → Field investigation needed
+Fraud Rate: 21.2% | Note: 79% NOT fraud (device malfunctions)
+Classification: Usually "Likely fraud" until field verification confirms
+""",
+    
+    'hardware_theft': """
+PRIMARY CHECK: Device active after theft date?
+- YES → NOT fraud (false alarm, customer still has device)
+- NO → Check DSR involvement
+  → DSR identified → Likely fraud (DSR discipline)
+  → Police report filed + Device inactive → Legitimate theft → No action
+Fraud Rate: 30% | Note: 70% NOT fraud (false alarms common)
+""",
+    
+    '3rd_party_cash': """
+PRIMARY CHECK: Customer knowledge of payer?
+- Customer DENIES knowing payer → Likely fraud (90% confidence)
+  → Pattern: Extortion/coercion → Field investigation
+- Customer CONFIRMS arrangement → NOT fraud
+  → Pattern: Voluntary family assistance → No action
+Fraud Rate: 68.2% | Suspect ID Rate: 68.2% (high)
+""",
+    
+    'cash_payments': """
+CHECK: Payment source analysis
+- Mpesa recipient ≠ Customer name + Customer unreachable → Likely fraud
+- DSR involved + Unauthorized cash collection → Confirmed fraud (DSR discipline)
+- New account + Immediate cash loan → Likely fraud
+Fraud Rate: 54.4% | Often overlaps with cash_loan_fraud
+""",
+    
+    'mis_selling': """
+CHECK: DSR pattern?
+- Repeated complaints vs same DSR → Confirmed fraud (DSR discipline)
+- First complaint + Serious discrepancy → Likely fraud (DSR warning)
+- Minor misunderstanding + Customer satisfied → NOT fraud
+Fraud Rate: 45.5% | Note: 82% end in "No action" (resolved with explanation)
+"""
+}
+
+# ============================================================================
+# DATABASE HELPERS (unchanged from original)
+# ============================================================================
 
 def init_db():
     """Initialize SQLite cache"""
@@ -66,9 +157,9 @@ def get_investigation(ticket_id):
     return json.loads(row[0]) if row else None
 
 
-# =============================================================================
-# API HELPERS
-# =============================================================================
+# ============================================================================
+# API HELPERS (unchanged from original)
+# ============================================================================
 
 def fetch_ticket(ticket_id):
     """Fetch ticket from Freshservice"""
@@ -112,7 +203,7 @@ def get_azure_connection():
 
 def run_sql_query(query_file, params):
     """Run SQL query from file"""
-    sql = Path(f"sql\{query_file}").read_text()
+    sql = Path(f"sql/{query_file}").read_text()
     
     conn = get_azure_connection()
     cursor = conn.cursor()
@@ -127,9 +218,9 @@ def run_sql_query(query_file, params):
     return [dict(zip(columns, row)) for row in rows]
 
 
-# =============================================================================
-# CLAUDE HELPERS
-# =============================================================================
+# ============================================================================
+# CLAUDE HELPERS (UPDATED FOR V2.0)
+# ============================================================================
 
 def call_claude(prompt):
     """Call Claude API"""
@@ -148,20 +239,15 @@ def call_claude(prompt):
     
     text = response.content[0].text.strip()
     
-    # Clean JSON from markdown and other formatting
-    # Remove markdown code blocks
+    # Clean JSON from markdown
     text = re.sub(r'```json\s*', '', text)
     text = re.sub(r'```\s*', '', text)
     
-    # Remove any text before the first {
     if '{' in text:
         text = text[text.find('{'):]
-    
-    # Remove any text after the last }
     if '}' in text:
         text = text[:text.rfind('}')+1]
     
-    # Try to parse JSON
     try:
         return json.loads(text.strip())
     except json.JSONDecodeError as e:
@@ -171,39 +257,83 @@ def call_claude(prompt):
 
 
 def query_planning(ticket_data):
-    """Phase 1: Decide what data to fetch"""
-    prompt_template = Path(r"C:\Users\EdwinKaranja\fraud_investigation\rebuild\prompts\query_planning.txt").read_text()
+    """
+    Phase 1: Query Planning (v2.0)
+    
+    New in v2.0:
+    - Wrong escalation detection
+    - Investigation subject identification
+    - Allegation-specific checks
+    """
+    prompt_template = Path("prompts/query_planning.txt").read_text()
     prompt = prompt_template.format(ticket_data=json.dumps(ticket_data, indent=2))
     
     return call_claude(prompt)
 
 
-def investigate(ticket_data, account_data, dfrs_data, history_data):
-    """Phase 2: Analyze and classify"""
-    prompt_template = Path(r"C:\Users\EdwinKaranja\fraud_investigation\rebuild\prompts\investigation.txt").read_text()
+def investigate(ticket_data, account_data, dfrs_data, history_data, query_plan):
+    """
+    Phase 2: Investigation (v2.0)
     
-    # Safely get ticket info
+    New in v2.0:
+    - Investigation subject context
+    - Allegation-specific guidance
+    - Evidence-based thresholds
+    """
+    prompt_template = Path("prompts/investigation.txt").read_text()
+    
+    # Get allegation-specific guidance
+    primary_allegation = query_plan.get('primary_allegation', '')
+    allegation_key = primary_allegation.replace('_', '')  # Remove underscores for key matching
+    guidance = ALLEGATION_GUIDANCE.get(allegation_key, "Standard investigation process")
+    
+    # Prepare ticket info
     subject = ticket_data.get('subject', '') if isinstance(ticket_data, dict) else ''
     details = ticket_data.get('case_details', '') if isinstance(ticket_data, dict) else ''
     
+    # Format account data
+    account_text = json.dumps(account_data, indent=2) if account_data else "Not found"
+    
+    # Format DFRS data
+    dfrs_text = "Not available"
+    if dfrs_data:
+        dfrs_text = f"""
+Fraud Score: {dfrs_data.get('FraudScore', 0):.2f}
+Tamper Score: {dfrs_data.get('HighestTamperScore', 0):.2f}
+Zero Credit Days: {dfrs_data.get('ZeroCreditDaysConsecutive', 0)}
+Tamper Reason: {dfrs_data.get('TamperReason', 'None')}
+"""
+    
+    # Format history
+    history_text = f"Found {len(history_data)} tickets" if history_data else "No history"
+    
     prompt = prompt_template.format(
+        investigation_subject=query_plan.get('investigation_subject', 'unknown'),
+        fraud_type=query_plan.get('fraud_type', 'unknown'),
+        primary_allegation=primary_allegation,
+        allegation_guidance=guidance,
         subject=subject,
         details=details,
-        account_data=json.dumps(account_data, indent=2) if account_data else "Not found",
-        dfrs_data=json.dumps(dfrs_data, indent=2) if dfrs_data else "Not available",
-        history_data=f"Found {len(history_data)} tickets" if history_data else "No history"
+        account_data=account_text,
+        dfrs_data=dfrs_text,
+        history_data=history_text
     )
     
     return call_claude(prompt)
 
 
-# =============================================================================
-# MAIN INVESTIGATION FUNCTION
-# =============================================================================
+# ============================================================================
+# MAIN INVESTIGATION FUNCTION (UPDATED FOR V2.0)
+# ============================================================================
 
 def investigate_ticket(ticket_id, use_cache=True):
     """
-    Main investigation function
+    Main investigation function v2.0
+    
+    New features:
+    - Wrong escalation detection
+    - Investigation subject identification
+    - Allegation-specific decision logic
     
     Args:
         ticket_id: Ticket to investigate
@@ -214,7 +344,7 @@ def investigate_ticket(ticket_id, use_cache=True):
     """
     
     print(f"\n{'='*70}")
-    print(f"🔍 INVESTIGATING TICKET #{ticket_id}")
+    print(f"🔍 INVESTIGATING TICKET #{ticket_id} (v2.0)")
     print(f"{'='*70}\n")
     
     # Check cache
@@ -226,6 +356,7 @@ def investigate_ticket(ticket_id, use_cache=True):
     
     result = {
         'ticket_id': ticket_id,
+        'version': '2.0',
         'timestamp': datetime.now(timezone.utc).isoformat(),
         'phases': {}
     }
@@ -237,17 +368,29 @@ def investigate_ticket(ticket_id, use_cache=True):
         print(f"   ✅ Subject: {ticket_data['subject'][:60]}...")
         result['phases']['fetch'] = 'success'
         
-        # PHASE 2: Query planning
+        # PHASE 2: Query planning (v2.0 - includes wrong escalation check)
         print("\n🤖 Phase 2: Query planning...")
         plan = query_planning(ticket_data)
-        print(f"   Fraud type: {plan['fraud_type']}")
-        print(f"   Fetch DFRS: {'Yes' if plan['fetch_dfrs'] else 'No'}")
-        print(f"   Fetch history: {'Yes' if plan['fetch_history'] else 'No'}")
+        
+        # Check for wrong escalation (NEW IN V2.0)
+        if plan.get('wrong_escalation'):
+            print("   ⚠️  WRONG ESCALATION DETECTED")
+            print(f"   Reasoning: {plan.get('reasoning')}")
+            result['wrong_escalation'] = True
+            result['query_plan'] = plan
+            result['success'] = True
+            return result
+        
+        print(f"   Investigation Subject: {plan.get('investigation_subject')}")
+        print(f"   Fraud Type: {plan.get('fraud_type')}")
+        print(f"   Allegation: {plan.get('primary_allegation')}")
+        print(f"   Fetch DFRS: {'Yes' if plan.get('execute_dfrs') else 'No'}")
+        print(f"   Fetch history: {'Yes' if plan.get('execute_history') else 'No'}")
         result['phases']['planning'] = plan
         
         # PHASE 3: Fetch account data (always)
-        print("\n📊 Phase 3: Fetching account data...")
-        ids = plan['identifiers']
+        print("\n📊 Phase 3: Fetching data...")
+        ids = plan.get('identifiers', {})
         account_data = run_sql_query('account_lookup.sql', (
             ids.get('imei'),
             ids.get('loan_id'),
@@ -265,11 +408,11 @@ def investigate_ticket(ticket_id, use_cache=True):
         
         # PHASE 4: Fetch DFRS (conditional)
         dfrs_data = None
-        if plan['fetch_dfrs'] and account and account.get('SupportsDFRS'):
+        if plan.get('execute_dfrs') and account and account.get('SupportsDFRS'):
             print("\n📊 Phase 4: Fetching DFRS...")
             dfrs_results = run_sql_query('dfrs_signals.sql', (
                 account.get('IMEI'),
-                account.get('LoanID')
+                account.get('AccountNumber')
             ))
             dfrs_data = dfrs_results[0] if dfrs_results else None
             
@@ -283,7 +426,7 @@ def investigate_ticket(ticket_id, use_cache=True):
         
         # PHASE 5: Fetch history (conditional)
         history_data = []
-        if plan['fetch_history'] and account:
+        if plan.get('execute_history') and account:
             print("\n📊 Phase 5: Fetching history...")
             history_data = run_sql_query('historical_tickets.sql', (
                 account.get('IMEI'),
@@ -295,17 +438,25 @@ def investigate_ticket(ticket_id, use_cache=True):
         
         result['phases']['history'] = history_data
         
-        # PHASE 6: Investigate
+        # PHASE 6: Investigate (v2.0 - with allegation-specific guidance)
         print("\n🔍 Phase 6: Analyzing...")
-        investigation = investigate(ticket_data, account, dfrs_data, history_data)
+        investigation = investigate(ticket_data, account, dfrs_data, history_data, plan)
         
         print(f"\n{'='*70}")
         print(f"✅ INVESTIGATION COMPLETE")
         print(f"{'='*70}")
+        print(f"   Investigation Subject: {plan.get('investigation_subject')}")
         print(f"   Status: {investigation['fraud_status']}")
         print(f"   Confidence: {investigation['confidence']:.0%}")
         print(f"   Outcome: {investigation['case_outcome']}")
-        print(f"\n   Summary: {investigation['summary']}")
+        
+        # Show suspect if identified (NEW IN V2.0)
+        if investigation.get('suspect_type'):
+            print(f"   Suspect Type: {investigation['suspect_type']}")
+            if investigation.get('suspect_name'):
+                print(f"   Suspect Name: {investigation['suspect_name']}")
+        
+        print(f"\n   Summary: {investigation['investigation_summary'][:100]}...")
         
         # Merge results
         result.update(investigation)
@@ -323,17 +474,17 @@ def investigate_ticket(ticket_id, use_cache=True):
         return result
 
 
-# =============================================================================
+# ============================================================================
 # INITIALIZATION
-# =============================================================================
+# ============================================================================
 
 # Initialize database on import
 init_db()
 
 
-# =============================================================================
+# ============================================================================
 # COMMAND LINE INTERFACE
-# =============================================================================
+# ============================================================================
 
 if __name__ == "__main__":
     import sys
