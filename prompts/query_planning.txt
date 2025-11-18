@@ -1,27 +1,139 @@
-You are analyzing a fraud ticket to decide which data to fetch.
+You are analyzing a fraud ticket to plan the investigation.
 
 TICKET DATA:
 {ticket_data}
 
-YOUR TASK:
-Extract identifiers (IMEI, Account Number, Loan ID, Phone) and decide:
-1. Should we fetch DFRS data? (only if device supports it and fraud involves device tampering)
-2. Should we fetch historical tickets? (usually yes - it's fast)
+═══════════════════════════════════════════════════════════════
+YOUR TASK: INVESTIGATION PLANNING
+═══════════════════════════════════════════════════════════════
 
-CRITICAL: Return ONLY valid JSON. No explanation, no markdown, no code blocks.
+STEP 1: WRONG ESCALATION CHECK
+──────────────────────────────
+Does this ticket show any wrong escalation signals?
+- "Manager following up" / "Screening"
+- "Insufficient information"
+- "Inventory issue" / "Stock issue"
+- Generic concern without specific fraud allegation
+- No evidence attached
 
-Example output:
+If YES → Mark wrong_escalation = true (investigation stops)
+
+STEP 2: INVESTIGATION SUBJECT IDENTIFICATION
+─────────────────────────────────────────────
+Who is the likely fraudster? (This becomes suspect_type if fraud confirmed)
+
+Options:
+- "customer" = Customer is the fraudster (resale, false reporting, breach of contract)
+- "dsr" = DSR is the fraudster (stolen ID, hardware theft, misconduct)
+- "external" = Third-party fraudster (scams, extortion, impersonation)
+- "unknown" = Cannot determine yet
+
+STEP 3: FRAUD TYPE & ALLEGATION CLASSIFICATION
+────────────────────────────────────────────────
+Based on description, classify:
+
+Fraud Type:
+- device_tampering (hacking, bypass, lock disabled)
+- account_takeover (PIN reset, unauthorized login)
+- cash_loan_fraud (unauthorized loan, scam)
+- payment_fraud (unauthorized payments, DSR cash collection)
+- identity_theft (stolen ID, fake KYC, wrong person)
+- resale (device resold, transferred)
+- dsr_misconduct (DSR theft, mis-selling)
+- external_scam (Facebook scam, extortion)
+
+Primary Allegation (specific):
+- "hacking_tampering" (device issues, tampering)
+- "identity_theft" (wrong person, stolen ID)
+- "cash_loan_fraud" (unauthorized loans)
+- "resale" (device transferred)
+- "3rd_party_cash" (someone else paying)
+- "hardware_theft" (device stolen)
+- "cash_payments" (payment issues, DSR cash)
+- "mis_selling" (DSR misrepresented terms)
+
+STEP 4: ALLEGATION-SPECIFIC CHECKS
+───────────────────────────────────
+
+Based on allegation, identify key decision points:
+
+RESALE:
+- Are payments continuing? (PRIMARY CHECK)
+- If yes → likely not fraud (transfer/gift allowed by policy)
+
+IDENTITY THEFT:
+- DSR involved? (CRITICAL - DSR stolen ID is major fraud)
+- Family member application? (common in Kenya, not fraud if paying)
+
+CASH LOAN FRAUD:
+- External scam pattern? (Facebook, call, OTP, promised money)
+- Account takeover pattern? (password change, PIN reset)
+- Customer denies pattern? (unauthorized loan claim)
+
+HACKING/TAMPERING:
+- Generic device issue? ("not working", "screen", "battery")
+  → 79% NOT fraud, quick auto-close
+- OR specific tampering? ("lock disabled", "IMEI changed", "bypass")
+  → 21% fraud, investigate
+
+HARDWARE THEFT:
+- Device active after theft date? → NOT fraud (false alarm)
+- DSR identified as thief? → Likely fraud, DSR discipline
+
+3RD PARTY CASH:
+- Customer denies knowing payer? → 90% fraud (extortion)
+- Customer confirms arrangement? → NOT fraud (family help)
+
+STEP 5: IDENTIFIER EXTRACTION
+──────────────────────────────
+Extract ALL identifiers from description:
+- IMEI: Device identifier
+- LoanID or AccountNumber: Account identifier
+- PhoneNumber: Customer/Suspect contact
+- Suspect name/phone if mentioned (CRITICAL - 99.3% fraud accuracy!)
+
+STEP 6: QUERY DECISIONS
+────────────────────────
+Decide which queries to execute:
+
+execute_dfrs:
+- YES if: Device fraud (hacking/tampering) AND device supports DFRS
+- YES if: High-risk case needing device forensics
+- NO if: Non-DFRS device OR low-priority case OR wrong escalation
+
+execute_history:
+- Usually YES (fast query, provides context)
+- NO only if: Pure external scam with no customer account OR wrong escalation
+
+═══════════════════════════════════════════════════════════════
+
+OUTPUT FORMAT (return only valid JSON, no markdown, no code blocks):
+
 {{
+  "wrong_escalation": true/false,
+  "investigation_subject": "customer" | "dsr" | "external" | "unknown",
   "identifiers": {{
-    "imei": "123456789",
-    "account_number": "ACC123",
-    "loan_id": null,
-    "phone": null
+    "imei": "..." or null,
+    "loan_id": "..." or null,
+    "account_number": "..." or null,
+    "phone": "..." or null
   }},
-  "fetch_dfrs": true,
-  "fetch_history": true,
-  "fraud_type": "device_tampering",
-  "reasoning": "Device tampering suspected based on ticket description"
+  "suspect_extracted": {{
+    "name": "..." or null,
+    "phone": "..." or null,
+    "type": "customer" | "dsr" | "external" or null
+  }},
+  "fraud_type": "device_tampering" | "account_takeover" | "cash_loan_fraud" | "payment_fraud" | "identity_theft" | "resale" | "dsr_misconduct" | "external_scam",
+  "primary_allegation": "hacking_tampering" | "identity_theft" | "cash_loan_fraud" | "resale" | "3rd_party_cash" | "hardware_theft" | "cash_payments" | "mis_selling",
+  "allegation_specific_checks": {{
+    "resale_payments_continuing": true/false or null,
+    "identity_dsr_involved": true/false or null,
+    "cash_loan_scenario": "external_scam" | "account_takeover" | "customer_denies" or null,
+    "tampering_description_type": "generic_device_issue" | "specific_tampering" or null
+  }},
+  "execute_dfrs": true/false,
+  "execute_history": true/false,
+  "reasoning": "Brief explanation of key decisions and concerns"
 }}
 
 Return your JSON now:

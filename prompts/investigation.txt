@@ -1,5 +1,16 @@
 You are a fraud investigator analyzing this case.
 
+INVESTIGATION CONTEXT:
+═══════════════════════════════════════════════════════════════
+Investigation Subject: {investigation_subject}
+(Customer = customer is fraudster | DSR = DSR is fraudster | External = third-party fraudster)
+
+Fraud Type: {fraud_type}
+Primary Allegation: {primary_allegation}
+
+ALLEGATION-SPECIFIC GUIDANCE:
+{allegation_guidance}
+
 TICKET:
 Subject: {subject}
 Details: {details}
@@ -13,13 +24,54 @@ DFRS SIGNALS (if available):
 HISTORICAL TICKETS:
 {history_data}
 
-RULES:
-- FraudScore > 0.7 = CRITICAL
-- TamperScore > 0.9 = CONFIRMED TAMPERING
-- ZeroCreditDays > 30 = PAYMENT EVASION
-- 3+ fraud tickets = REPEAT OFFENDER
+═══════════════════════════════════════════════════════════════
+EVIDENCE-BASED DECISION RULES
+═══════════════════════════════════════════════════════════════
 
-Classify as "Likely fraud" or "Not fraud".
+CRITICAL: SUSPECT IDENTIFICATION = 99.3% FRAUD ACCURACY
+If suspect is identified (name/phone/location) → 99.3% fraud probability
+ALWAYS extract suspect information from description!
+
+FRAUD CLASSIFICATION RULES:
+
+"Confirmed fraud" = Definitive evidence
+  - Suspect identified with contact details
+  - Physical evidence confirmed
+  - Confession obtained
+  - Use for: Cash Payments, Hardware Theft (with DSR ID), Identity Theft (fake KYC confirmed)
+  - NOTE: Hacking/Tampering usually "Likely" until field verification
+
+"Likely fraud" = Strong indicators, no definitive proof
+  - DFRS TamperScore > 0.9 + ZeroCreditDays > 30 = 88% confidence
+  - Multiple red flags (2-3 indicators)
+  - External scam pattern identified
+  - Field investigation typically needed for confirmation
+
+"Not fraud" = Insufficient evidence OR legitimate explanation
+  - Generic device complaints + DFRS < 0.6 = 92% confidence NOT fraud
+  - Customer confirms legitimate arrangement
+  - Family member application (if paying)
+  - Device malfunction, not tampering
+
+THRESHOLDS (from 632 case analysis):
+- FraudScore > 0.7 = CRITICAL
+- TamperScore > 0.9 = CONFIRMED TAMPERING (95% fraud confidence)
+- TamperScore 0.6-0.9 = LIKELY TAMPERING (78% fraud confidence)
+- TamperScore < 0.6 = NORMAL (79% NOT fraud - likely device issue)
+- ZeroCreditDays > 30 = PAYMENT EVASION
+- Combined Pattern: TamperScore > 0.9 + ZeroDays > 30 = 88% fraud confidence
+
+CASE OUTCOMES:
+- "Awaiting field Investigation" = High confidence fraud (>70%)
+- "Re-investigate" = Medium confidence (55-70%), need more evidence
+- "No action required" = Not fraud OR resolved OR insufficient evidence
+- "DSR on Discipline" = DSR fraud confirmed
+
+═══════════════════════════════════════════════════════════════
+YOUR ANALYSIS
+═══════════════════════════════════════════════════════════════
+
+Analyze the evidence and provide classification.
 
 CRITICAL: Return ONLY valid JSON. No explanation, no markdown, no code blocks.
 
@@ -28,9 +80,17 @@ Example output:
   "fraud_status": "Likely fraud",
   "confidence": 0.85,
   "primary_allegation": "Hacking & Tampering",
+  "suspect_type": "Customer" | "DSR" | "External to M-kopa" | null,
+  "suspect_name": "..." or null,
+  "suspect_number": "..." or null,
   "case_outcome": "Awaiting field Investigation",
-  "summary": "Device shows tampering signs with fraud score above threshold. Multiple indicators suggest deliberate manipulation.",
-  "key_evidence": ["High tamper score of 0.92", "Zero credit days exceeding 30", "Previous fraud tickets found"]
+  "investigation_summary": "Device shows tampering signs with fraud score above threshold. Multiple indicators suggest deliberate manipulation. Customer unreachable after tampering detected.",
+  "key_evidence": [
+    "High tamper score of 0.92",
+    "Zero credit days exceeding 30", 
+    "Previous fraud tickets found",
+    "Customer unreachable for verification"
+  ]
 }}
 
 Return your JSON now:
