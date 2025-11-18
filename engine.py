@@ -1,15 +1,12 @@
 """
-M-KOPA Fraud Investigation Engine v2.0
-Evidence-based investigation with allegation-specific rules
+M-KOPA Fraud Investigation Engine v2.2
+Simple Freshdesk source ticket integration
 
-Updates in v2.0:
-- Investigation subject identification (Customer/DSR/External)
-- Allegation-specific decision guidance
-- Wrong escalation detection
-- Evidence-based thresholds from 632 cases
-- Simplified structure (maintains compatibility with existing files)
+New in v2.2:
+- Auto-fetch Freshdesk source ticket from description
+- Add as 'freshdesk_source' field for Claude analysis
 
-Last Updated: 2025-11-14
+Last Updated: 2025-11-18
 """
 
 import os
@@ -28,7 +25,7 @@ from azure.identity import AzureCliCredential
 import config
 
 # ============================================================================
-# ALLEGATION-SPECIFIC GUIDANCE (NEW IN V2.0)
+# ALLEGATION-SPECIFIC GUIDANCE
 # ============================================================================
 
 ALLEGATION_GUIDANCE = {
@@ -111,7 +108,7 @@ Fraud Rate: 45.5% | Note: 82% end in "No action" (resolved with explanation)
 }
 
 # ============================================================================
-# DATABASE HELPERS (unchanged from original)
+# DATABASE HELPERS
 # ============================================================================
 
 def init_db():
@@ -158,11 +155,11 @@ def get_investigation(ticket_id):
 
 
 # ============================================================================
-# API HELPERS (unchanged from original)
+# API HELPERS
 # ============================================================================
 
-def fetch_ticket(ticket_id):
-    """Fetch ticket from Freshservice"""
+def fetch_freshservice_ticket(ticket_id):
+    """Fetch ticket from Freshservice API"""
     api_key = os.getenv('FRESHSERVICE_API_KEY')
     if not api_key:
         raise ValueError("FRESHSERVICE_API_KEY not set")
@@ -181,6 +178,73 @@ def fetch_ticket(ticket_id):
         'case_details': ticket.get('custom_fields', {}).get('case_details', ''),
         'conversations': data.get('conversations', [])
     }
+
+
+def fetch_freshdesk_ticket(ticket_id):
+    """Fetch ticket from Freshdesk API"""
+    api_key = os.getenv('FRESHDESK_API_KEY')
+    if not api_key:
+        print(f"   ⚠️  FRESHDESK_API_KEY not set, skipping Freshdesk fetch")
+        return None
+    
+    try:
+        # Fetch ticket
+        url = f"https://m-kopa.freshdesk.com/api/v2/tickets/{ticket_id}"
+        response = requests.get(url, auth=(api_key, 'X'), timeout=30)
+        
+        if response.status_code == 404:
+            print(f"   ⚠️  Freshdesk ticket #{ticket_id} not found")
+            return None
+        
+        response.raise_for_status()
+        ticket = response.json()
+        
+        # Fetch conversations
+        conv_url = f"https://m-kopa.freshdesk.com/api/v2/tickets/{ticket_id}/conversations"
+        conv_response = requests.get(conv_url, auth=(api_key, 'X'), timeout=30)
+        conversations = conv_response.json() if conv_response.status_code == 200 else []
+        
+        return {
+            'ticket_id': ticket_id,
+            'subject': ticket.get('subject', ''),
+            'description': ticket.get('description_text', '') or ticket.get('description', ''),
+            'case_details': ticket.get('custom_fields', {}).get('cf_case_details', ''),
+            'conversations': conversations
+        }
+    
+    except Exception as e:
+        print(f"   ⚠️  Failed to fetch Freshdesk ticket: {e}")
+        return None
+
+
+def fetch_ticket(ticket_id):
+    """
+    Fetch ticket from Freshservice and auto-fetch Freshdesk source if referenced
+    
+    Args:
+        ticket_id: Freshservice ticket ID
+        
+    Returns:
+        Ticket data dict with optional 'freshdesk_source' field
+    """
+    # Fetch main Freshservice ticket
+    ticket_data = fetch_freshservice_ticket(ticket_id)
+    
+    # Look for Freshdesk URL in description
+    fd_pattern = r'https://m-kopa\.freshdesk\.com/helpdesk/tickets/(\d+)'
+    fd_match = re.search(fd_pattern, ticket_data['description'])
+    
+    # If Freshdesk URL found, fetch that ticket too
+    if fd_match:
+        fd_ticket_id = fd_match.group(1)
+        print(f"   🔗 Found Freshdesk source ticket #{fd_ticket_id}")
+        
+        fd_ticket = fetch_freshdesk_ticket(fd_ticket_id)
+        if fd_ticket:
+            ticket_data['freshdesk_source'] = fd_ticket
+            print(f"   ✅ Fetched Freshdesk source ticket")
+    
+    return ticket_data
 
 
 def get_azure_connection():
@@ -203,7 +267,7 @@ def get_azure_connection():
 
 def run_sql_query(query_file, params):
     """Run SQL query from file"""
-    sql = Path(f"sql/{query_file}").read_text()
+    sql = Path(f"sql/{query_file}").read_text(encoding='utf-8')
     
     conn = get_azure_connection()
     cursor = conn.cursor()
@@ -219,7 +283,7 @@ def run_sql_query(query_file, params):
 
 
 # ============================================================================
-# CLAUDE HELPERS (UPDATED FOR V2.0)
+# CLAUDE HELPERS
 # ============================================================================
 
 def call_claude(prompt):
@@ -257,34 +321,20 @@ def call_claude(prompt):
 
 
 def query_planning(ticket_data):
-    """
-    Phase 1: Query Planning (v2.0)
-    
-    New in v2.0:
-    - Wrong escalation detection
-    - Investigation subject identification
-    - Allegation-specific checks
-    """
-    prompt_template = Path("prompts/query_planning.txt").read_text()
+    """Phase 1: Query Planning"""
+    prompt_template = Path("prompts/query_planning.txt").read_text(encoding='utf-8')
     prompt = prompt_template.format(ticket_data=json.dumps(ticket_data, indent=2))
     
     return call_claude(prompt)
 
 
 def investigate(ticket_data, account_data, dfrs_data, history_data, query_plan):
-    """
-    Phase 2: Investigation (v2.0)
-    
-    New in v2.0:
-    - Investigation subject context
-    - Allegation-specific guidance
-    - Evidence-based thresholds
-    """
-    prompt_template = Path("prompts/investigation.txt").read_text()
+    """Phase 2: Investigation"""
+    prompt_template = Path("prompts/investigation.txt").read_text(encoding='utf-8')
     
     # Get allegation-specific guidance
     primary_allegation = query_plan.get('primary_allegation', '')
-    allegation_key = primary_allegation.replace('_', '')  # Remove underscores for key matching
+    allegation_key = primary_allegation.replace('_', '')
     guidance = ALLEGATION_GUIDANCE.get(allegation_key, "Standard investigation process")
     
     # Prepare ticket info
@@ -323,20 +373,18 @@ Tamper Reason: {dfrs_data.get('TamperReason', 'None')}
 
 
 # ============================================================================
-# MAIN INVESTIGATION FUNCTION (UPDATED FOR V2.0)
+# MAIN INVESTIGATION FUNCTION
 # ============================================================================
 
 def investigate_ticket(ticket_id, use_cache=True):
     """
-    Main investigation function v2.0
+    Main investigation function v2.2
     
-    New features:
-    - Wrong escalation detection
-    - Investigation subject identification
-    - Allegation-specific decision logic
+    New in v2.2:
+    - Auto-fetch Freshdesk source ticket if referenced in description
     
     Args:
-        ticket_id: Ticket to investigate
+        ticket_id: Freshservice ticket ID
         use_cache: Check cache first
         
     Returns:
@@ -344,7 +392,7 @@ def investigate_ticket(ticket_id, use_cache=True):
     """
     
     print(f"\n{'='*70}")
-    print(f"🔍 INVESTIGATING TICKET #{ticket_id} (v2.0)")
+    print(f"🔍 INVESTIGATING TICKET #{ticket_id} (v2.2)")
     print(f"{'='*70}\n")
     
     # Check cache
@@ -356,23 +404,23 @@ def investigate_ticket(ticket_id, use_cache=True):
     
     result = {
         'ticket_id': ticket_id,
-        'version': '2.0',
+        'version': '2.2',
         'timestamp': datetime.now(timezone.utc).isoformat(),
         'phases': {}
     }
     
     try:
-        # PHASE 1: Fetch ticket
+        # PHASE 1: Fetch ticket (with Freshdesk source if referenced)
         print("📥 Phase 1: Fetching ticket...")
         ticket_data = fetch_ticket(ticket_id)
         print(f"   ✅ Subject: {ticket_data['subject'][:60]}...")
         result['phases']['fetch'] = 'success'
         
-        # PHASE 2: Query planning (v2.0 - includes wrong escalation check)
+        # PHASE 2: Query planning
         print("\n🤖 Phase 2: Query planning...")
         plan = query_planning(ticket_data)
         
-        # Check for wrong escalation (NEW IN V2.0)
+        # Check for wrong escalation
         if plan.get('wrong_escalation'):
             print("   ⚠️  WRONG ESCALATION DETECTED")
             print(f"   Reasoning: {plan.get('reasoning')}")
@@ -388,12 +436,12 @@ def investigate_ticket(ticket_id, use_cache=True):
         print(f"   Fetch history: {'Yes' if plan.get('execute_history') else 'No'}")
         result['phases']['planning'] = plan
         
-        # PHASE 3: Fetch account data (always)
-        print("\n📊 Phase 3: Fetching data...")
+        # PHASE 3: Fetch account data
+        print("\n📊 Phase 3: Fetching account data...")
         ids = plan.get('identifiers', {})
         account_data = run_sql_query('account_lookup.sql', (
             ids.get('imei'),
-            ids.get('loan_id'),
+            ids.get('phone'),
             ids.get('account_number')
         ))
         account = account_data[0] if account_data else None
@@ -427,7 +475,7 @@ def investigate_ticket(ticket_id, use_cache=True):
         # PHASE 5: Fetch history (conditional)
         history_data = []
         if plan.get('execute_history') and account:
-            print("\n📊 Phase 5: Fetching history...")
+            print("\n📊 Phase 5: Fetching historical tickets...")
             history_data = run_sql_query('historical_tickets.sql', (
                 account.get('IMEI'),
                 account.get('AccountNumber')
@@ -438,8 +486,8 @@ def investigate_ticket(ticket_id, use_cache=True):
         
         result['phases']['history'] = history_data
         
-        # PHASE 6: Investigate (v2.0 - with allegation-specific guidance)
-        print("\n🔍 Phase 6: Analyzing...")
+        # PHASE 6: Investigate
+        print("\n🔎 Phase 6: Analyzing...")
         investigation = investigate(ticket_data, account, dfrs_data, history_data, plan)
         
         print(f"\n{'='*70}")
@@ -450,7 +498,7 @@ def investigate_ticket(ticket_id, use_cache=True):
         print(f"   Confidence: {investigation['confidence']:.0%}")
         print(f"   Outcome: {investigation['case_outcome']}")
         
-        # Show suspect if identified (NEW IN V2.0)
+        # Show suspect if identified
         if investigation.get('suspect_type'):
             print(f"   Suspect Type: {investigation['suspect_type']}")
             if investigation.get('suspect_name'):

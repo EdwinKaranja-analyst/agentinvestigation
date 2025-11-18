@@ -19,7 +19,7 @@ FROM raw_datalake.[EventLoginSuccessful]
 
 
 
-DECLARE @CustomerId UNIQUEIDENTIFIER = '41921778-0c63-f011-909b-000d3a2f4e87';
+DECLARE @CustomerId UNIQUEIDENTIFIER = ?;
 
 WITH account_devices AS (
     -- Get all devices this customer has logged in from
