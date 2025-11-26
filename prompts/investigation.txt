@@ -13,13 +13,19 @@ ALLEGATION-SPECIFIC GUIDANCE:
 
 TICKET:
 Subject: {subject}
-Details: {details}
+Description: {description}
 
 ACCOUNT DATA:
 {account_data}
 
 DFRS SIGNALS (if available):
 {dfrs_data}
+
+LOGIN RISK SIGNALS (if available):
+{login_risk_data}
+
+PAYMENT MATCHING (if available):
+{payment_data}
 
 HISTORICAL TICKETS:
 {history_data}
@@ -60,6 +66,16 @@ THRESHOLDS (from 632 case analysis):
 - TamperScore < 0.6 = NORMAL (79% NOT fraud - likely device issue)
 - ZeroCreditDays > 30 = PAYMENT EVASION
 - Combined Pattern: TamperScore > 0.9 + ZeroDays > 30 = 88% fraud confidence
+
+LOGIN RISK INDICATORS:
+- Device Risk Level: CRITICAL/HIGH = Account takeover likely
+- Max Customers Per Device ≥ 10 = Shared device fraud ring
+- Unique Devices Used ≥ 10 = Account hopping pattern
+
+PAYMENT MATCHING INDICATORS:
+- KYC Fraud Likelihood: HIGH RISK/MEDIUM-HIGH RISK = Identity fraud
+- Name Match Ratio = 0 = Never pays under registered name (2.9x higher KYC risk)
+- Phone Match Ratio < 0.10 = Third-party payment pattern
 
 CASE OUTCOMES:
 - "Awaiting field Investigation" = High confidence fraud (>70%)
