@@ -91,6 +91,7 @@ Extract ALL identifiers from description:
 - LoanID or AccountNumber: Account identifier
 - PhoneNumber: Customer/Suspect contact
 - Suspect name/phone if mentioned (CRITICAL - 99.3% fraud accuracy!)
+- Freshdesk ticket link. 
 
 STEP 6: QUERY DECISIONS
 ────────────────────────
@@ -116,7 +117,8 @@ OUTPUT FORMAT (return only valid JSON, no markdown, no code blocks):
     "imei": "..." or null,
     "loan_id": "..." or null,
     "account_number": "..." or null,
-    "phone": "..." or null
+    "phone": "..." or null,
+    "fresdesklink": "..." or null
   }},
   "suspect_extracted": {{
     "name": "..." or null,
