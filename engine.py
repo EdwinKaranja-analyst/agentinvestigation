@@ -1,13 +1,25 @@
 """
-M-KOPA Fraud Investigation Engine v2.2
-Simple Freshdesk source ticket integration
+M-KOPA Fraud Investigation Engine v2.1
+Evidence-based investigation with priority & case helper comments
 
-New in v2.2:
-- Auto-fetch Freshdesk source ticket from description
-- Add as 'freshdesk_source' field for Claude analysis
+Updates in v2.1:
+- Auto-update Freshservice with priority and case comments
+- Wrong escalation flagging with special handling
+- Priority calculation (1=Low, 2=Medium, 3=High, 4=Critical)
+- Case helper comments for fraud team
 
-Last Updated: 2025-11-18
+Updates in v2.0:
+- Investigation subject identification (Customer/DSR/External)
+- Allegation-specific decision guidance
+- Wrong escalation detection
+- Evidence-based thresholds from 632 cases
+
+Last Updated: 2025-11-26
 """
+
+# TODO:Consider an option to pick out data from database instead of Freshservice
+# TODO: Avoid updating tickets in groups like Arrest tracker.
+
 
 import os
 import json
@@ -23,10 +35,9 @@ import struct
 from azure.identity import AzureCliCredential
 
 import config
-from queries_config import QUERIES, should_run_query, get_query_params
 
 # ============================================================================
-# ALLEGATION-SPECIFIC GUIDANCE
+# ALLEGATION-SPECIFIC GUIDANCE (NEW IN V2.0)
 # ============================================================================
 
 ALLEGATION_GUIDANCE = {
@@ -109,7 +120,7 @@ Fraud Rate: 45.5% | Note: 82% end in "No action" (resolved with explanation)
 }
 
 # ============================================================================
-# DATABASE HELPERS
+# DATABASE HELPERS (unchanged from original)
 # ============================================================================
 
 def init_db():
@@ -156,11 +167,11 @@ def get_investigation(ticket_id):
 
 
 # ============================================================================
-# API HELPERS
+# API HELPERS (unchanged from original)
 # ============================================================================
 
-def fetch_freshservice_ticket(ticket_id):
-    """Fetch ticket from Freshservice API"""
+def fetch_ticket(ticket_id):
+    """Fetch ticket from Freshservice"""
     api_key = os.getenv('FRESHSERVICE_API_KEY')
     if not api_key:
         raise ValueError("FRESHSERVICE_API_KEY not set")
@@ -179,73 +190,6 @@ def fetch_freshservice_ticket(ticket_id):
         'case_details': ticket.get('custom_fields', {}).get('case_details', ''),
         'conversations': data.get('conversations', [])
     }
-
-
-def fetch_freshdesk_ticket(ticket_id):
-    """Fetch ticket from Freshdesk API"""
-    api_key = os.getenv('FRESHDESK_API_KEY')
-    if not api_key:
-        print(f"   ⚠️  FRESHDESK_API_KEY not set, skipping Freshdesk fetch")
-        return None
-    
-    try:
-        # Fetch ticket
-        url = f"https://m-kopa.freshdesk.com/api/v2/tickets/{ticket_id}"
-        response = requests.get(url, auth=(api_key, 'X'), timeout=30)
-        
-        if response.status_code == 404:
-            print(f"   ⚠️  Freshdesk ticket #{ticket_id} not found")
-            return None
-        
-        response.raise_for_status()
-        ticket = response.json()
-        
-        # Fetch conversations
-        conv_url = f"https://m-kopa.freshdesk.com/api/v2/tickets/{ticket_id}/conversations"
-        conv_response = requests.get(conv_url, auth=(api_key, 'X'), timeout=30)
-        conversations = conv_response.json() if conv_response.status_code == 200 else []
-        
-        return {
-            'ticket_id': ticket_id,
-            'subject': ticket.get('subject', ''),
-            'description': ticket.get('description_text', '') or ticket.get('description', ''),
-            'case_details': ticket.get('custom_fields', {}).get('cf_case_details', ''),
-            'conversations': conversations
-        }
-    
-    except Exception as e:
-        print(f"   ⚠️  Failed to fetch Freshdesk ticket: {e}")
-        return None
-
-
-def fetch_ticket(ticket_id):
-    """
-    Fetch ticket from Freshservice and auto-fetch Freshdesk source if referenced
-    
-    Args:
-        ticket_id: Freshservice ticket ID
-        
-    Returns:
-        Ticket data dict with optional 'freshdesk_source' field
-    """
-    # Fetch main Freshservice ticket
-    ticket_data = fetch_freshservice_ticket(ticket_id)
-    
-    # Look for Freshdesk URL in description
-    fd_pattern = r'https://m-kopa\.freshdesk\.com/helpdesk/tickets/(\d+)'
-    fd_match = re.search(fd_pattern, ticket_data['description'])
-    
-    # If Freshdesk URL found, fetch that ticket too
-    if fd_match:
-        fd_ticket_id = fd_match.group(1)
-        print(f"   🔗 Found Freshdesk source ticket #{fd_ticket_id}")
-        
-        fd_ticket = fetch_freshdesk_ticket(fd_ticket_id)
-        if fd_ticket:
-            ticket_data['freshdesk_source'] = fd_ticket
-            print(f"   ✅ Fetched Freshdesk source ticket")
-    
-    return ticket_data
 
 
 def get_azure_connection():
@@ -280,11 +224,248 @@ def run_sql_query(query_file, params):
     cursor.close()
     conn.close()
     
-    return [dict(zip(columns, row)) for row in rows]
+    # Handle encoding issues in results
+    results = []
+    for row in rows:
+        row_dict = {}
+        for col, val in zip(columns, row):
+            if isinstance(val, str):
+                # Clean up any encoding issues
+                try:
+                    val = val.encode('latin1').decode('utf-8')
+                except (UnicodeDecodeError, UnicodeEncodeError):
+                    # If conversion fails, keep as-is but replace problematic chars
+                    val = val.encode('utf-8', errors='replace').decode('utf-8')
+            row_dict[col] = val
+        results.append(row_dict)
+    
+    return results
 
 
 # ============================================================================
-# CLAUDE HELPERS
+# PRIORITY & COMMENT HELPERS (NEW IN V2.1)
+# ============================================================================
+
+def calculate_priority(investigation, plan, dfrs_data):
+    """
+    Calculate ticket priority (1=Low, 2=Medium, 3=High, 4=Critical)
+    Based on fraud confidence, allegation type, and evidence strength
+    
+    Args:
+        investigation: Investigation results
+        plan: Query plan with allegation info
+        dfrs_data: DFRS signals if available
+        
+    Returns:
+        int: Priority score (1-4)
+    """
+    
+    fraud_status = investigation.get('fraud_status', '')
+    confidence = investigation.get('confidence', 0)
+    allegation = plan.get('primary_allegation', '')
+    suspect_identified = bool(investigation.get('suspect_name'))
+    
+    # CRITICAL (4)
+    if allegation == 'cash_loan_fraud':
+        return 4  # 58.8% fraud rate - always critical
+    
+    if suspect_identified:
+        return 4  # 99.3% fraud accuracy when suspect identified
+    
+    if dfrs_data:
+        tamper = dfrs_data.get('TamperScore', 0)
+        zero_days = dfrs_data.get('ZeroCreditDaysConsecutive', 0)
+        if tamper > 0.9 and zero_days > 30:
+            return 4  # 88% fraud confidence
+    
+    if allegation == '3rd_party_cash' and confidence > 0.85:
+        return 4  # Customer denies knowing payer = 90% fraud
+    
+    # HIGH (3)
+    if fraud_status == 'Confirmed fraud':
+        return 3
+    
+    if allegation == 'resale' and confidence > 0.65:
+        return 3  # 70% fraud rate
+    
+    if allegation == 'hardware_theft' and plan.get('investigation_subject') == 'dsr':
+        return 3  # DSR theft
+    
+    if allegation == 'identity_theft' and plan.get('allegation_specific_checks', {}).get('identity_dsr_involved'):
+        return 3  # DSR stolen ID
+    
+    if dfrs_data and dfrs_data.get('FraudScore', 0) > 0.7:
+        return 3
+    
+    # MEDIUM (2)
+    if fraud_status == 'Likely fraud' and confidence >= 0.55:
+        return 2
+    
+    if allegation in ['mis_selling', 'cash_payments']:
+        return 2
+    
+    # LOW (1)
+    if fraud_status == 'Not fraud':
+        return 1
+    
+    if allegation == 'hacking_tampering':
+        tampering_type = plan.get('allegation_specific_checks', {}).get('tampering_description_type')
+        if tampering_type == 'generic_device_issue':
+            return 1  # 79% NOT fraud
+    
+    # Default MEDIUM
+    return 2
+
+
+def generate_case_helper_comment(investigation, plan, account_data, dfrs_data, wrong_escalation=False):
+    """
+    Generate internal case helper comment for fraud team
+    
+    Args:
+        investigation: Investigation results
+        plan: Query plan
+        account_data: Account info
+        dfrs_data: DFRS signals
+        wrong_escalation: Is this a wrong escalation?
+        
+    Returns:
+        str: Formatted comment for Freshservice
+    """
+    
+    lines = []
+    lines.append("🤖 AI INVESTIGATION SUMMARY")
+    lines.append("=" * 50)
+    
+    # Wrong escalation handling
+    if wrong_escalation:
+        lines.append("⚠️ WRONG ESCALATION DETECTED")
+        lines.append("")
+        lines.append(f"Reason: {plan.get('reasoning', 'Not a fraud case')}")
+        lines.append("")
+        lines.append("RECOMMENDED ACTION:")
+        lines.append("• Reassign to appropriate team")
+        lines.append("• Update ticket category")
+        lines.append("• Close if insufficient information")
+        return "\n".join(lines)
+    
+    # Priority and confidence
+    fraud_status = investigation.get('fraud_status', 'Unknown')
+    confidence = investigation.get('confidence', 0)
+    lines.append(f"Status: {fraud_status} ({confidence:.0%} confidence)")
+    
+    # Investigation subject
+    subject = plan.get('investigation_subject', 'unknown')
+    lines.append(f"Investigation Subject: {subject.title()}")
+    
+    # Allegation
+    allegation = plan.get('primary_allegation', 'unknown')
+    lines.append(f"Allegation: {allegation.replace('_', ' ').title()}")
+    
+    # Suspect info if identified
+    if investigation.get('suspect_name'):
+        lines.append("")
+        lines.append("⚠️ SUSPECT IDENTIFIED (99.3% fraud accuracy)")
+        lines.append(f"Type: {investigation.get('suspect_type', 'Unknown')}")
+        lines.append(f"Name: {investigation.get('suspect_name')}")
+        if investigation.get('suspect_number'):
+            lines.append(f"Phone: {investigation.get('suspect_number')}")
+    
+    # Account info
+    if account_data:
+        lines.append("")
+        lines.append("📊 ACCOUNT INFO:")
+        lines.append(f"Account: {account_data.get('AccountNumber', 'N/A')}")
+        lines.append(f"Device: {account_data.get('BrandModel', 'N/A')}")
+        if account_data.get('IMEI'):
+            lines.append(f"IMEI: {account_data.get('IMEI')}")
+    
+    # DFRS signals if available
+    if dfrs_data:
+        lines.append("")
+        lines.append("📊 DFRS SIGNALS:")
+        lines.append(f"Fraud Score: {dfrs_data.get('FraudScore', 0):.2f}")
+        lines.append(f"Tamper Score: {dfrs_data.get('TamperScore', 0):.2f}")
+        lines.append(f"Zero Credit Days: {dfrs_data.get('ZeroCreditDaysConsecutive', 0)}")
+        if dfrs_data.get('TamperReason'):
+            lines.append(f"Tamper Reason: {dfrs_data.get('TamperReason')}")
+    
+    # Key evidence
+    evidence = investigation.get('key_evidence', [])
+    if evidence:
+        lines.append("")
+        lines.append("🔍 KEY EVIDENCE:")
+        for item in evidence[:5]:  # Top 5
+            lines.append(f"• {item}")
+    
+    # Recommended outcome
+    outcome = investigation.get('case_outcome', 'Unknown')
+    lines.append("")
+    lines.append("✅ RECOMMENDED OUTCOME:")
+    lines.append(f"{outcome}")
+    
+    # Investigation summary
+    lines.append("")
+    lines.append("📝 ANALYSIS:")
+    lines.append(investigation.get('investigation_summary', 'No summary available'))
+    
+    # Add timestamp
+    lines.append("")
+    lines.append(f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    lines.append(f"System Version: 2.1")
+    
+    return "\n".join(lines)
+
+
+def update_freshservice_ticket(ticket_id, priority, comment):
+    """
+    Update Freshservice ticket with priority and internal note
+    
+    Args:
+        ticket_id: Ticket ID
+        priority: 1-4 (1=Low, 2=Medium, 3=High, 4=Critical)
+        comment: Case helper comment (internal note)
+        
+    Returns:
+        bool: True if successful
+    """
+    api_key = os.getenv('FRESHSERVICE_API_KEY')
+    if not api_key:
+        raise ValueError("FRESHSERVICE_API_KEY not set")
+    
+    # Update priority
+    url = f"{config.FRESHSERVICE_URL}/tickets/{ticket_id}"
+    update_data = {
+        "priority": priority
+    }
+    
+    response = requests.put(
+        url, 
+        json=update_data,
+        auth=(api_key, 'X'),
+        timeout=30
+    )
+    response.raise_for_status()
+    
+    # Add internal note
+    notes_url = f"{config.FRESHSERVICE_URL}/tickets/{ticket_id}/notes"
+    note_data = {
+        "body": comment,
+        "private": True  # Internal note - not visible to customer
+    }
+    
+    response = requests.post(
+        notes_url,
+        json=note_data,
+        auth=(api_key, 'X'),
+        timeout=30
+    )
+    response.raise_for_status()
+    
+    return True
+
+
+# ============================================================================
+# CLAUDE HELPERS (UPDATED FOR V2.0)
 # ============================================================================
 
 def call_claude(prompt):
@@ -321,141 +502,136 @@ def call_claude(prompt):
         raise ValueError(f"Claude returned invalid JSON: {str(e)}")
 
 
-def query_planning(ticket_data, historical_metadata=None):
+def query_planning(ticket_data):
     """
-    Phase 1: Query Planning
+    Phase 1: Query Planning (v2.0)
     
-    Args:
-        ticket_data: Main ticket data
-        historical_metadata: Optional list of historical ticket metadata
+    New in v2.0:
+    - Wrong escalation detection
+    - Investigation subject identification
+    - Allegation-specific checks
     """
     prompt_template = Path("prompts/query_planning.txt").read_text(encoding='utf-8')
-    
-    # Add historical metadata if available
-    history_context = ""
-    if historical_metadata:
-        history_context = f"\n\nHISTORICAL TICKETS METADATA:\n{json.dumps(historical_metadata, indent=2)}\n"
-        history_context += "\nBased on the historical tickets above, which ticket IDs are relevant to this investigation? "
-        history_context += "Return them in 'relevant_historical_tickets' as a list of ticket IDs."
-    
-    prompt = prompt_template.format(
-        ticket_data=json.dumps(ticket_data, indent=2),
-        historical_context=history_context
-    )
+    prompt = prompt_template.format(ticket_data=json.dumps(ticket_data, indent=2, default=str))
     
     return call_claude(prompt)
 
 
-def investigate(ticket_data, account_data, query_results, query_plan):
+def investigate(ticket_data, account_data, dfrs_data, history_data, query_plan):
     """
-    Phase 2: Investigation
+    Phase 2: Investigation (v2.0)
     
-    Args:
-        ticket_data: Main ticket data
-        account_data: Account lookup results
-        query_results: Dict of all query results (dfrs, login_risk, history, etc.)
-        query_plan: Query planning response
+    New in v2.0:
+    - Investigation subject context
+    - Allegation-specific guidance
+    - Evidence-based thresholds
     """
-    prompt_template = Path("prompts/investigation.txt").read_text(encoding='utf-8')
-    
-    # Get allegation-specific guidance
-    primary_allegation = query_plan.get('primary_allegation', '')
-    allegation_key = primary_allegation.replace('_', '')
-    guidance = ALLEGATION_GUIDANCE.get(allegation_key, "Standard investigation process")
-    
-    # Prepare ticket info
-    subject = ticket_data.get('subject', '') if isinstance(ticket_data, dict) else ''
-    description = ticket_data.get('description', '') if isinstance(ticket_data, dict) else ''
-    
-    # Format account data
-    account_text = json.dumps(account_data, indent=2) if account_data else "Not found"
-    
-    # Format DFRS data
-    dfrs_data = query_results.get('dfrs_signals')
-    dfrs_text = "Not available"
-    if dfrs_data:
-        dfrs_text = f"""
+    try:
+        prompt_template = Path("prompts/investigation.txt").read_text(encoding='utf-8')
+        
+        # Get allegation-specific guidance
+        primary_allegation = query_plan.get('primary_allegation', '')
+        allegation_key = primary_allegation.replace('_', '')  # Remove underscores for key matching
+        guidance = ALLEGATION_GUIDANCE.get(allegation_key, "Standard investigation process")
+        
+        # Prepare ticket info - handle various field names
+        subject = ''
+        details = ''
+        
+        if isinstance(ticket_data, dict):
+            subject = ticket_data.get('subject', '')
+            # Try multiple possible field names for details
+            details = (
+                ticket_data.get('case_details') or 
+                ticket_data.get('description') or 
+                ticket_data.get('description_text') or 
+                ''
+            )
+        
+        # Format account data
+        account_text = json.dumps(account_data, indent=2, default=str) if account_data else "Not found"
+        
+        # Format DFRS data
+        dfrs_text = "Not available"
+        if dfrs_data:
+            dfrs_text = f"""
 Fraud Score: {dfrs_data.get('FraudScore', 0):.2f}
-Tamper Score: {dfrs_data.get('HighestTamperScore', 0):.2f}
+Tamper Score: {dfrs_data.get('TamperScore', 0) or dfrs_data.get('HighestTamperScore', 0):.2f}
 Zero Credit Days: {dfrs_data.get('ZeroCreditDaysConsecutive', 0)}
 Tamper Reason: {dfrs_data.get('TamperReason', 'None')}
 """
-    
-    # Format login risk data
-    login_risk_data = query_results.get('login_risk')
-    login_risk_text = "Not available"
-    if login_risk_data:
-        login_risk_text = f"""
-Device Risk Level: {login_risk_data.get('device_risk_level', 'Unknown')}
-Unique Devices Used: {login_risk_data.get('unique_devices_used', 0)}
-Max Customers Per Device: {login_risk_data.get('max_customers_per_device', 0)}
-"""
-    
-    # Format payment match data
-    payment_data = query_results.get('payment_match')
-    payment_text = "Not available"
-    if payment_data:
-        payment_text = f"""
-KYC Fraud Likelihood: {payment_data.get('kyc_fraud_likelihood', 'Unknown')}
-Name Match Ratio: {payment_data.get('name_match_ratio', 0):.0%}
-Phone Match Ratio: {payment_data.get('phone_match_ratio', 0):.0%}
-"""
-    
-    # Format history
-    history_data = query_results.get('historical_tickets', [])
-    history_text = "No history"
-    if history_data:
-        if isinstance(history_data, list) and len(history_data) > 0:
-            # Check if enhanced (has full ticket details)
-            if isinstance(history_data[0], dict) and 'description' in history_data[0]:
-                history_text = f"Found {len(history_data)} relevant tickets with full details:\n"
-                for ticket in history_data:
-                    history_text += f"\n--- Ticket #{ticket.get('ticket_id')} ---\n"
-                    history_text += f"Subject: {ticket.get('subject')}\n"
-                    history_text += f"Description: {ticket.get('description')[:200]}...\n"
-            else:
-                history_text = f"Found {len(history_data)} tickets"
-    
-    prompt = prompt_template.format(
-        investigation_subject=query_plan.get('investigation_subject', 'unknown'),
-        fraud_type=query_plan.get('fraud_type', 'unknown'),
-        primary_allegation=primary_allegation,
-        allegation_guidance=guidance,
-        subject=subject,
-        description=description,
-        account_data=account_text,
-        dfrs_data=dfrs_text,
-        history_data=history_text,
-        login_risk_data=login_risk_text,
-        payment_data=payment_text
-    )
-    
-    return call_claude(prompt)
+        
+        # Format history
+        history_text = f"Found {len(history_data)} tickets" if history_data else "No history"
+        
+        # Prepare all possible template variables (for backward compatibility with v2.0 prompts)
+        template_vars = {
+            'investigation_subject': query_plan.get('investigation_subject', 'unknown'),
+            'fraud_type': query_plan.get('fraud_type', 'unknown'),
+            'primary_allegation': primary_allegation,
+            'allegation_guidance': guidance,
+            'subject': subject,
+            'details': details,
+            'description': details,  # Backward compatibility
+            'account_data': account_text,
+            'dfrs_data': dfrs_text,
+            'history_data': history_text,
+            'login_risk_data': "Not available",  # For v2.0 compatibility
+            'payment_match_data': "Not available",  # For v2.0 compatibility
+            'payment_data': "Not available"  # For v2.0 compatibility
+        }
+        
+        # Safe formatting that handles ANY missing keys
+        import re
+        
+        def safe_format(template, variables):
+            """Format template with variables, providing 'Not available' for missing keys"""
+            def replace_var(match):
+                key = match.group(1)
+                return str(variables.get(key, "Not available"))
+            
+            return re.sub(r'\{(\w+)\}', replace_var, template)
+        
+        prompt = safe_format(prompt_template, template_vars)
+        
+        return call_claude(prompt)
+        
+    except Exception as e:
+        print(f"   Error in investigate(): {str(e)}")
+        print(f"   ticket_data type: {type(ticket_data)}")
+        if isinstance(ticket_data, dict):
+            print(f"   ticket_data keys: {list(ticket_data.keys())}")
+        raise
 
 
 # ============================================================================
-# MAIN INVESTIGATION FUNCTION
+# MAIN INVESTIGATION FUNCTION (UPDATED FOR V2.1)
 # ============================================================================
 
-def investigate_ticket(ticket_id, use_cache=True):
+def investigate_ticket(ticket_id, use_cache=True, update_freshservice=True):
     """
-    Main investigation function v2.3
+    Main investigation function v2.1
     
-    New in v2.3:
-    - Query registry system for simple query management
-    - Auto-execution based on allegation type
-    - Smart historical ticket fetching (Claude selects relevant ones)
+    New in v2.1:
+    - Auto-update Freshservice with priority and comments
+    - Wrong escalation flagging
+    
+    New in v2.0:
+    - Wrong escalation detection
+    - Investigation subject identification
+    - Allegation-specific decision logic
     
     Args:
-        ticket_id: Freshservice ticket ID
+        ticket_id: Ticket to investigate
         use_cache: Check cache first
+        update_freshservice: Update Freshservice ticket (default True)
         
     Returns:
         Investigation result dict
     """
     
     print(f"\n{'='*70}")
-    print(f"🔍 INVESTIGATING TICKET #{ticket_id} (v2.3)")
+    print(f"🔍 INVESTIGATING TICKET #{ticket_id} (v2.1)")
     print(f"{'='*70}\n")
     
     # Check cache
@@ -467,36 +643,70 @@ def investigate_ticket(ticket_id, use_cache=True):
     
     result = {
         'ticket_id': ticket_id,
-        'version': '2.3',
+        'version': '2.1',
         'timestamp': datetime.now(timezone.utc).isoformat(),
         'phases': {}
     }
     
     try:
-        # PHASE 1: Fetch ticket (with Freshdesk source if referenced)
+        # PHASE 1: Fetch ticket
         print("📥 Phase 1: Fetching ticket...")
         ticket_data = fetch_ticket(ticket_id)
         print(f"   ✅ Subject: {ticket_data['subject'][:60]}...")
         result['phases']['fetch'] = 'success'
         
-        # PHASE 2: Fetch account data (always needed)
-        print("\n📊 Phase 2: Fetching account data...")
+        # PHASE 2: Query planning (v2.0 - includes wrong escalation check)
+        print("\n🤖 Phase 2: Query planning...")
+        plan = query_planning(ticket_data)
         
-        # First get basic query planning without history to extract identifiers
-        preliminary_plan = query_planning(ticket_data)
-        
-        if preliminary_plan.get('wrong_escalation'):
+        # Check for wrong escalation (NEW IN V2.0)
+        if plan.get('wrong_escalation'):
             print("   ⚠️  WRONG ESCALATION DETECTED")
-            print(f"   Reasoning: {preliminary_plan.get('reasoning')}")
+            print(f"   Reasoning: {plan.get('reasoning')}")
+            
             result['wrong_escalation'] = True
-            result['query_plan'] = preliminary_plan
+            result['query_plan'] = plan
             result['success'] = True
+            
+            # For wrong escalations, set low priority and special comment
+            result['priority'] = 1
+            result['priority_label'] = 'Low'
+            result['case_helper_comment'] = generate_case_helper_comment(
+                {}, plan, None, None, wrong_escalation=True
+            )
+            
+            # Update Freshservice for wrong escalations too
+            if update_freshservice:
+                try:
+                    update_freshservice_ticket(
+                        ticket_id,
+                        result['priority'],
+                        result['case_helper_comment']
+                    )
+                    print("   ✅ Freshservice updated (wrong escalation flagged)")
+                    result['freshservice_updated'] = True
+                except Exception as e:
+                    print(f"   ⚠️  Freshservice update failed: {e}")
+                    result['freshservice_updated'] = False
+            
+            # Save to cache
+            save_investigation(ticket_id, result)
+            
             return result
         
-        ids = preliminary_plan.get('identifiers', {})
+        print(f"   Investigation Subject: {plan.get('investigation_subject')}")
+        print(f"   Fraud Type: {plan.get('fraud_type')}")
+        print(f"   Allegation: {plan.get('primary_allegation')}")
+        print(f"   Fetch DFRS: {'Yes' if plan.get('execute_dfrs') else 'No'}")
+        print(f"   Fetch history: {'Yes' if plan.get('execute_history') else 'No'}")
+        result['phases']['planning'] = plan
+        
+        # PHASE 3: Fetch account data (always)
+        print("\n📊 Phase 3: Fetching data...")
+        ids = plan.get('identifiers', {})
         account_data = run_sql_query('account_lookup.sql', (
             ids.get('imei'),
-            ids.get('phone'),
+            ids.get('loan_id'),
             ids.get('account_number')
         ))
         account = account_data[0] if account_data else None
@@ -509,82 +719,51 @@ def investigate_ticket(ticket_id, use_cache=True):
         
         result['phases']['account'] = account
         
-        # PHASE 3: Get historical tickets metadata
-        print("\n📊 Phase 3: Fetching historical tickets metadata...")
-        historical_metadata = []
-        if account:
-            historical_metadata = run_sql_query('historical_tickets.sql', (
+        # PHASE 4: Fetch DFRS (conditional)
+        dfrs_data = None
+        if plan.get('execute_dfrs') and account and account.get('SupportsDFRS'):
+            print("\n📊 Phase 4: Fetching DFRS...")
+            dfrs_results = run_sql_query('dfrs_signals.sql', (
                 account.get('IMEI'),
                 account.get('AccountNumber')
             ))
-            print(f"   Found {len(historical_metadata)} tickets")
-        else:
-            print("   ⏭️  Skipped (no account)")
-        
-        # PHASE 4: Query planning with historical metadata (Claude decides which to fetch)
-        print("\n🤖 Phase 4: Query planning with historical context...")
-        plan = query_planning(ticket_data, historical_metadata)
-        
-        print(f"   Investigation Subject: {plan.get('investigation_subject')}")
-        print(f"   Fraud Type: {plan.get('fraud_type')}")
-        print(f"   Allegation: {plan.get('primary_allegation')}")
-        
-        # Check which historical tickets Claude selected
-        relevant_ticket_ids = plan.get('relevant_historical_tickets', [])
-        if relevant_ticket_ids:
-            print(f"   Claude selected {len(relevant_ticket_ids)} relevant historical tickets")
-        
-        result['phases']['planning'] = plan
-        
-        # PHASE 5: Fetch full details for relevant historical tickets
-        enhanced_history = []
-        if relevant_ticket_ids:
-            print(f"\n📋 Phase 5: Fetching {len(relevant_ticket_ids)} relevant historical tickets...")
-            for tid in relevant_ticket_ids:
-                try:
-                    hist_ticket = fetch_freshservice_ticket(str(tid))
-                    enhanced_history.append(hist_ticket)
-                    print(f"   ✅ Fetched #{tid}")
-                except Exception as e:
-                    print(f"   ⚠️  Failed to fetch #{tid}: {e}")
-        else:
-            print(f"\n⏭️  Phase 5: No relevant historical tickets selected")
-        
-        # PHASE 6: Execute queries based on allegation (registry-based)
-        print(f"\n📊 Phase 6: Executing queries based on allegation...")
-        primary_allegation = plan.get('primary_allegation', '')
-        
-        query_results = {}
-        for query_name, config in QUERIES.items():
-            # Skip historical_tickets (already handled)
-            if query_name == 'historical_tickets':
-                query_results[query_name] = enhanced_history
-                continue
+            dfrs_data = dfrs_results[0] if dfrs_results else None
             
-            # Check if query should run
-            if should_run_query(query_name, primary_allegation, account):
-                print(f"   Running {query_name}...")
-                params = get_query_params(query_name, ids, account)
-                
-                try:
-                    results = run_sql_query(config['file'], params)
-                    query_results[query_name] = results[0] if results else None
-                    
-                    if results:
-                        print(f"   ✅ {query_name} completed")
-                    else:
-                        print(f"   ⚠️  {query_name} returned no data")
-                except Exception as e:
-                    print(f"   ❌ {query_name} failed: {e}")
-                    query_results[query_name] = None
-            else:
-                print(f"   ⏭️  Skipped {query_name}")
+            if dfrs_data:
+                print(f"   Fraud Score: {dfrs_data.get('FraudScore', 0):.2f}")
+                print(f"   Tamper Score: {dfrs_data.get('HighestTamperScore', 0):.2f}")
+        else:
+            print("\n⏭️  Phase 4: DFRS skipped")
         
-        result['phases']['queries'] = {k: 'completed' if v else 'no_data' for k, v in query_results.items()}
+        result['phases']['dfrs'] = dfrs_data
         
-        # PHASE 7: Investigate with all data
-        print("\n🔎 Phase 7: Analyzing...")
-        investigation = investigate(ticket_data, account, query_results, plan)
+        # PHASE 5: Fetch history (conditional)
+        history_data = []
+        if plan.get('execute_history') and account:
+            print("\n📊 Phase 5: Fetching history...")
+            history_data = run_sql_query('historical_tickets.sql', (
+                account.get('IMEI'),
+                account.get('AccountNumber')
+            ))
+            print(f"   Found {len(history_data)} tickets")
+        else:
+            print("\n⏭️  Phase 5: History skipped")
+        
+        result['phases']['history'] = history_data
+        
+        # PHASE 6: Investigate (v2.0 - with allegation-specific guidance)
+        print("\n🔍 Phase 6: Analyzing...")
+        investigation = investigate(ticket_data, account, dfrs_data, history_data, plan)
+        
+        # PHASE 7: Calculate priority & generate comment (NEW IN V2.1)
+        print("\n📊 Phase 7: Generating priority & comment...")
+        priority = calculate_priority(investigation, plan, dfrs_data)
+        priority_label = {1: 'Low', 2: 'Medium', 3: 'High', 4: 'Critical'}[priority]
+        case_comment = generate_case_helper_comment(investigation, plan, account, dfrs_data)
+        
+        investigation['priority'] = priority
+        investigation['priority_label'] = priority_label
+        investigation['case_helper_comment'] = case_comment
         
         print(f"\n{'='*70}")
         print(f"✅ INVESTIGATION COMPLETE")
@@ -592,15 +771,30 @@ def investigate_ticket(ticket_id, use_cache=True):
         print(f"   Investigation Subject: {plan.get('investigation_subject')}")
         print(f"   Status: {investigation['fraud_status']}")
         print(f"   Confidence: {investigation['confidence']:.0%}")
+        print(f"   Priority: {priority_label} ({priority})")
         print(f"   Outcome: {investigation['case_outcome']}")
         
-        # Show suspect if identified
+        # Show suspect if identified (NEW IN V2.0)
         if investigation.get('suspect_type'):
             print(f"   Suspect Type: {investigation['suspect_type']}")
             if investigation.get('suspect_name'):
                 print(f"   Suspect Name: {investigation['suspect_name']}")
         
         print(f"\n   Summary: {investigation['investigation_summary'][:100]}...")
+        
+        # PHASE 8: Update Freshservice (NEW IN V2.1)
+        if update_freshservice:
+            print("\n📤 Phase 8: Updating Freshservice...")
+            try:
+                update_freshservice_ticket(ticket_id, priority, case_comment)
+                print("   ✅ Freshservice updated")
+                investigation['freshservice_updated'] = True
+            except Exception as e:
+                print(f"   ⚠️  Freshservice update failed: {e}")
+                investigation['freshservice_updated'] = False
+        else:
+            print("\n⏭️  Phase 8: Freshservice update skipped")
+            investigation['freshservice_updated'] = False
         
         # Merge results
         result.update(investigation)
@@ -614,9 +808,11 @@ def investigate_ticket(ticket_id, use_cache=True):
     except Exception as e:
         print(f"\n❌ Error: {str(e)}")
         import traceback
+        print(f"\nFull traceback:")
         traceback.print_exc()
         result['success'] = False
         result['error'] = str(e)
+        result['error_traceback'] = traceback.format_exc()
         return result
 
 
@@ -636,11 +832,14 @@ if __name__ == "__main__":
     import sys
     
     if len(sys.argv) < 2:
-        print("Usage: python engine.py <ticket_id>")
+        print("Usage: python engine.py <ticket_id> [--no-update]")
+        print("  --no-update: Skip Freshservice update")
         sys.exit(1)
     
     ticket_id = sys.argv[1]
-    result = investigate_ticket(ticket_id)
+    update_fs = '--no-update' not in sys.argv
+    
+    result = investigate_ticket(ticket_id, update_freshservice=update_fs)
     
     # Print result as JSON
     print(f"\n{'='*70}")

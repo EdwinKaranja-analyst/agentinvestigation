@@ -1,25 +1,5 @@
-    SELECT 
-        InstallationID,
-        COUNT(DISTINCT AccountIdOrPhone) as AccountsLogin,
-        COUNT(*) as TotalLogins
-    FROM [raw_datalake].[EventLoginSuccessful] WITH (NOLOCK)
-    WHERE TRY_CONVERT(datetime2, OccurredAt) IS NOT NULL
-        AND AccountType = 'Customer'
-        AND InstallationID IS NOT NULL
-        AND TRY_CONVERT(datetime2, OccurredAt) > DATEADD(M,-8,GETDATE())
-    GROUP BY InstallationID
-    HAVING COUNT(DISTINCT AccountIdOrPhone) >= 10
-
-
-
-
-SELECT TOP 100*
-
-FROM raw_datalake.[EventLoginSuccessful]
-
-
-
 DECLARE @CustomerId UNIQUEIDENTIFIER = ?;
+
 
 WITH account_devices AS (
     -- Get all devices this customer has logged in from
