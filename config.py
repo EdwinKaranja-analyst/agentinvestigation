@@ -1,7 +1,7 @@
 """
 Simple configuration file - all settings in one place
 """
-
+# TODO: Move sensitive settings to environment variables or secure vault
 # API Endpoints
 FRESHSERVICE_URL = "https://m-kopaservicedesk.freshservice.com/api/v2"
 SYNAPSE_SERVER = "mk-prd-we-ap-synapse.sql.azuresynapse.net"
